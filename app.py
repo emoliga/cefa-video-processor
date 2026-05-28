@@ -73,6 +73,25 @@ def download_video(url: str, dest: str) -> bool:
     return True
 
 
+def compress_video(video_path: str) -> str:
+    """
+    Recompress video to 720p max, CRF 28, before processing.
+    Returns path to compressed file (replaces original).
+    """
+    compressed = video_path.replace(".mp4", "_compressed.mp4")
+    subprocess.run([
+        FFMPEG, "-y", "-i", video_path,
+        "-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease",
+        "-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "64k",
+        "-movflags", "+faststart",
+        compressed
+    ], check=True, capture_output=True)
+    os.remove(video_path)
+    os.rename(compressed, video_path)
+    return video_path
+
+
 def extract_audio(video_path: str, audio_path: str):
     """Extract audio as mp3 using ffmpeg."""
     subprocess.run([
@@ -291,9 +310,11 @@ def process_video():
         duration = get_video_duration(video_path)
 
         try:
+            # Recompress to 720p to reduce RAM usage during frame extraction
+            compress_video(video_path)
             extract_audio(video_path, audio_path)
             extract_frames(video_path, frames_dir, fps)
-            # Delete original video immediately to free memory
+            # Delete compressed video immediately to free memory
             os.remove(video_path)
         except subprocess.CalledProcessError as e:
             stderr_text = e.stderr.decode() if e.stderr else "no stderr"
