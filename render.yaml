@@ -2,16 +2,14 @@ services:
   - type: web
     name: video-to-report
     env: python
-    buildCommand: |
-      pip install -r requirements.txt
-      apt-get update && apt-get install -y ffmpeg
-    startCommand: gunicorn main:app --workers 2 --timeout 300 --bind 0.0.0.0:$PORT
+    runtime: python
+    pythonVersion: "3.11.9"
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --workers 1 --timeout 300 --bind 0.0.0.0:$PORT
     envVars:
       - key: OPENAI_API_KEY
-        sync: false   # Set manually in Render dashboard
+        sync: false
       - key: STEP_KEYWORD
         value: "cambiamos al siguiente paso"
-      - key: PYTHON_VERSION
-        value: "3.11.0"
     healthCheckPath: /health
     autoDeploy: true
