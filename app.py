@@ -276,21 +276,34 @@ def build_steps(transcription: dict, split_timestamps: list, frames_dir: str, fp
     """Segment transcription and frames into steps based on split timestamps."""
     boundaries = [0.0] + sorted(split_timestamps) + [duration]
     segments = transcription.get("segments", [])
+    keyword_lower = KEYWORD.lower()
     steps = []
 
     for i in range(len(boundaries) - 1):
         start = boundaries[i]
         end = boundaries[i + 1]
 
-        step_text = " ".join(
-            seg["text"].strip()
-            for seg in segments
+        # Collect segments for this time window
+        window_segs = [
+            seg for seg in segments
             if seg.get("start", 0) >= start and seg.get("start", 0) < end
-        ).strip()
+        ]
 
-        keyword_lower = KEYWORD.lower()
+        # Remove the keyword segment itself (it's the transition marker, not content)
+        # The keyword segment is the one whose text contains the keyword phrase
+        content_segs = [
+            seg for seg in window_segs
+            if keyword_lower not in seg.get("text", "").lower()
+        ]
+
+        step_text = " ".join(seg["text"].strip() for seg in content_segs).strip()
+
+        # Also strip keyword if it leaked to start/end of text
         if step_text.lower().startswith(keyword_lower):
             step_text = step_text[len(keyword_lower):].strip().lstrip(",. ")
+        if keyword_lower in step_text.lower():
+            idx = step_text.lower().find(keyword_lower)
+            step_text = step_text[:idx].strip()
 
         frames_b64 = get_step_frames(frames_dir, fps, start, end)
 
