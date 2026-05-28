@@ -5,7 +5,7 @@ services:
     runtime: python
     pythonVersion: "3.11.9"
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app --workers 1 --timeout 300 --bind 0.0.0.0:$PORT
+    startCommand: gunicorn main:app --workers 1 --worker-class sync --timeout 600 --bind 0.0.0.0:$PORT --max-requests 10 --max-requests-jitter 5
     envVars:
       - key: OPENAI_API_KEY
         sync: false
