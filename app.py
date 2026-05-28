@@ -79,14 +79,18 @@ def compress_video(video_path: str) -> str:
     Returns path to compressed file (replaces original).
     """
     compressed = video_path.replace(".mp4", "_compressed.mp4")
-    subprocess.run([
+    # Use Popen instead of run to avoid gunicorn worker timeout killing the process
+    proc = subprocess.Popen([
         FFMPEG, "-y", "-i", video_path,
         "-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
         "-c:a", "aac", "-b:a", "64k",
         "-movflags", "+faststart",
         compressed
-    ], check=True, capture_output=True)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, FFMPEG)
     os.remove(video_path)
     os.rename(compressed, video_path)
     return video_path
@@ -94,24 +98,29 @@ def compress_video(video_path: str) -> str:
 
 def extract_audio(video_path: str, audio_path: str):
     """Extract audio as mp3 using ffmpeg."""
-    subprocess.run([
+    proc = subprocess.Popen([
         FFMPEG, "-y", "-i", video_path,
         "-vn", "-ar", "16000", "-ac", "1", "-b:a", "64k",
         audio_path
-    ], check=True, capture_output=True)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, FFMPEG)
 
 
 def extract_frames(video_path: str, frames_dir: str, fps: float = 1.0):
     """Extract frames at given fps, capped at 300 frames to avoid OOM."""
     Path(frames_dir).mkdir(exist_ok=True)
-    # scale down aggressively to save memory: 480px wide
-    subprocess.run([
+    proc = subprocess.Popen([
         FFMPEG, "-y", "-i", video_path,
-        "-vf", f"fps={fps},scale=480:-1",
+        "-vf", f"fps={fps},scale=480:-2",
         "-q:v", "5",
         "-frames:v", "300",
         f"{frames_dir}/frame_%06d.jpg"
-    ], check=True, capture_output=True)
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.wait()
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, FFMPEG)
 
 
 def get_video_duration(video_path: str) -> float:
