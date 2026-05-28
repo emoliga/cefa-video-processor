@@ -3,6 +3,7 @@ import json
 import base64
 import tempfile
 import subprocess
+import threading
 from pathlib import Path
 from flask import Flask, request, jsonify
 import requests
@@ -11,6 +12,23 @@ import imageio_ffmpeg
 
 app = Flask(__name__)
 client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+
+def _run_ffmpeg(cmd: list) -> int:
+    """Run ffmpeg in a thread to avoid gunicorn worker signal conflicts."""
+    result = {"returncode": None}
+
+    def target():
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 close_fds=True)
+        result["returncode"] = proc.wait()
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout=540)  # 9 min max per ffmpeg call
+    if t.is_alive():
+        raise TimeoutError("ffmpeg timed out after 540s")
+    return result["returncode"]
 
 KEYWORD = os.environ.get("STEP_KEYWORD", "cambiamos al siguiente paso")
 
@@ -80,17 +98,16 @@ def compress_video(video_path: str) -> str:
     """
     compressed = video_path.replace(".mp4", "_compressed.mp4")
     # Use Popen instead of run to avoid gunicorn worker timeout killing the process
-    proc = subprocess.Popen([
+    rc = _run_ffmpeg([
         FFMPEG, "-y", "-i", video_path,
         "-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
         "-c:a", "aac", "-b:a", "64k",
         "-movflags", "+faststart",
         compressed
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    proc.wait()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, FFMPEG)
+    ])
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, FFMPEG)
     os.remove(video_path)
     os.rename(compressed, video_path)
     return video_path
@@ -98,29 +115,27 @@ def compress_video(video_path: str) -> str:
 
 def extract_audio(video_path: str, audio_path: str):
     """Extract audio as mp3 using ffmpeg."""
-    proc = subprocess.Popen([
+    rc = _run_ffmpeg([
         FFMPEG, "-y", "-i", video_path,
         "-vn", "-ar", "16000", "-ac", "1", "-b:a", "64k",
         audio_path
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    proc.wait()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, FFMPEG)
+    ])
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, FFMPEG)
 
 
 def extract_frames(video_path: str, frames_dir: str, fps: float = 1.0):
     """Extract frames at given fps, capped at 300 frames to avoid OOM."""
     Path(frames_dir).mkdir(exist_ok=True)
-    proc = subprocess.Popen([
+    rc = _run_ffmpeg([
         FFMPEG, "-y", "-i", video_path,
         "-vf", f"fps={fps},scale=480:-2",
         "-q:v", "5",
         "-frames:v", "300",
         f"{frames_dir}/frame_%06d.jpg"
-    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    proc.wait()
-    if proc.returncode != 0:
-        raise subprocess.CalledProcessError(proc.returncode, FFMPEG)
+    ])
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, FFMPEG)
 
 
 def get_video_duration(video_path: str) -> float:
