@@ -29,12 +29,47 @@ Respond ONLY with valid JSON, no markdown:
 
 
 def download_video(url: str, dest: str) -> bool:
-    """Download video from URL (supports Supabase signed URLs)."""
-    r = requests.get(url, stream=True, timeout=120)
+    """Download video from URL. Handles Google Drive large file confirmation."""
+    import re
+    session = requests.Session()
+
+    r = session.get(url, stream=True, timeout=120)
     r.raise_for_status()
+
+    # Google Drive returns an HTML confirmation page for large files
+    content_type = r.headers.get("Content-Type", "")
+    if "text/html" in content_type:
+        chunk = next(r.iter_content(chunk_size=32768), b"")
+        text = chunk.decode("utf-8", errors="ignore")
+
+        # Try confirm token pattern
+        match = re.search(r'confirm=([^&"]+)', text)
+        if match:
+            confirm_token = match.group(1)
+            file_id = re.search(r'[?&]id=([^&]+)', url)
+            if file_id:
+                url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id.group(1)}"
+            else:
+                url = url + f"&confirm={confirm_token}"
+        else:
+            # Newer Drive flow
+            file_id_match = re.search(r'[?&]id=([^&]+)', url)
+            if file_id_match:
+                fid = file_id_match.group(1)
+                url = f"https://drive.usercontent.google.com/download?id={fid}&export=download&confirm=t"
+
+        r = session.get(url, stream=True, timeout=300)
+        r.raise_for_status()
+
     with open(dest, "wb") as f:
-        for chunk in r.iter_content(chunk_size=8192):
-            f.write(chunk)
+        for chunk in r.iter_content(chunk_size=65536):
+            if chunk:
+                f.write(chunk)
+
+    size = os.path.getsize(dest)
+    if size < 100_000:
+        raise ValueError(f"Downloaded file too small ({size} bytes) - likely not a valid video or Drive link is not public")
+
     return True
 
 
@@ -48,12 +83,14 @@ def extract_audio(video_path: str, audio_path: str):
 
 
 def extract_frames(video_path: str, frames_dir: str, fps: float = 1.0):
-    """Extract frames at given fps."""
+    """Extract frames at given fps, capped at 300 frames to avoid OOM."""
     Path(frames_dir).mkdir(exist_ok=True)
+    # scale down aggressively to save memory: 480px wide
     subprocess.run([
         FFMPEG, "-y", "-i", video_path,
-        "-vf", f"fps={fps},scale=640:-1",
-        "-q:v", "3",
+        "-vf", f"fps={fps},scale=480:-1",
+        "-q:v", "5",
+        "-frames:v", "300",
         f"{frames_dir}/frame_%06d.jpg"
     ], check=True, capture_output=True)
 
@@ -85,7 +122,13 @@ def transcribe_audio(audio_path: str) -> dict:
             response_format="verbose_json",
             timestamp_granularities=["segment"]
         )
-    return response.model_dump()
+    result = response.model_dump()
+    # Free disk space immediately
+    try:
+        os.remove(audio_path)
+    except Exception:
+        pass
+    return result
 
 
 def find_keyword_timestamps(transcription: dict, keyword: str) -> list:
@@ -250,8 +293,11 @@ def process_video():
         try:
             extract_audio(video_path, audio_path)
             extract_frames(video_path, frames_dir, fps)
+            # Delete original video immediately to free memory
+            os.remove(video_path)
         except subprocess.CalledProcessError as e:
-            return jsonify({"error": f"ffmpeg error: {e.stderr.decode()}"}), 500
+            stderr_text = e.stderr.decode() if e.stderr else "no stderr"
+            return jsonify({"error": f"ffmpeg error: {stderr_text}"}), 500
 
         try:
             transcription = transcribe_audio(audio_path)
