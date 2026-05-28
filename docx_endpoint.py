@@ -173,40 +173,38 @@ def build_docx(title: str, steps: list[dict], metadata: dict) -> bytes:
     return buf.read()
 
 
-def _add_frames_row(doc: Document, frames_b64: list[str], max_width_cm: float = 5.5):
+def _add_frames_row(doc: Document, frames_b64: list, max_width_cm: float = 5.0):
     """Add images side by side in a table row."""
-    n = min(len(frames_b64), 3)
+    # Filter valid frames first
+    valid_frames = []
+    for f in frames_b64[:3]:
+        try:
+            img_bytes = base64.b64decode(f)
+            if len(img_bytes) > 100:  # sanity check
+                valid_frames.append(img_bytes)
+        except Exception:
+            pass
+
+    n = len(valid_frames)
     if n == 0:
         return
-    
+
     table = doc.add_table(rows=1, cols=n)
     table.style = "Table Grid"
-    # Remove borders
-    for row in table.rows:
-        for cell in row.cells:
-            tc = cell._tc
-            tcPr = tc.get_or_add_tcPr()
-            tcBorders = OxmlElement("w:tcBorders")
-            for side in ["top", "left", "bottom", "right"]:
-                border = OxmlElement(f"w:{side}")
-                border.set(qn("w:val"), "none")
-                tcBorders.append(border)
-            tcPr.append(tcBorders)
-    
+
     row = table.rows[0]
-    for i, frame_b64 in enumerate(frames_b64[:n]):
+    for i, img_bytes in enumerate(valid_frames):
         cell = row.cells[i]
-        cell.paragraphs[0].clear()
-        
+        para = cell.paragraphs[0]
+        para.clear()
         try:
-            img_bytes = base64.b64decode(frame_b64)
             img_stream = io.BytesIO(img_bytes)
-            run = cell.paragraphs[0].add_run()
+            run = para.add_run()
             run.add_picture(img_stream, width=Cm(max_width_cm))
-        except Exception:
-            cell.paragraphs[0].add_run("[imagen no disponible]")
-    
-    doc.add_paragraph()  # spacing after table
+        except Exception as e:
+            para.add_run(f"[imagen {i+1}]")
+
+    doc.add_paragraph()
 
 
 def _fmt_duration(seconds: float) -> str:
