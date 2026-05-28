@@ -1,424 +1,254 @@
-import os
-import json
+"""
+Endpoint to generate a .docx report from processed video steps.
+Add this to app.py or keep as a separate blueprint.
+"""
+
+import io
 import base64
-import tempfile
-import subprocess
-import threading
-from pathlib import Path
-from flask import Flask, request, jsonify
-import requests
-from openai import OpenAI
-import imageio_ffmpeg
+from flask import Blueprint, request, jsonify, send_file
+from docx import Document
+from docx.shared import Inches, Pt, RGBColor, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+import datetime
 
-app = Flask(__name__)
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+docx_bp = Blueprint("docx", __name__)
 
-
-def _run_ffmpeg(cmd: list) -> int:
-    """Run ffmpeg in a thread to avoid gunicorn worker signal conflicts."""
-    result = {"returncode": None}
-
-    def target():
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                 close_fds=True)
-        result["returncode"] = proc.wait()
-
-    t = threading.Thread(target=target, daemon=True)
-    t.start()
-    t.join(timeout=540)  # 9 min max per ffmpeg call
-    if t.is_alive():
-        raise TimeoutError("ffmpeg timed out after 540s")
-    return result["returncode"]
-
-KEYWORD = os.environ.get("STEP_KEYWORD", "cambiamos al siguiente paso")
-
-# Use ffmpeg binary bundled with imageio-ffmpeg (no system ffmpeg needed)
-FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
-FFPROBE = FFMPEG.replace("ffmpeg", "ffprobe")
-
-GESTURE_PROMPT = """Analyze this image and determine if a person is showing a "rock" hand gesture:
-- Index finger pointing up OR index + pinky extended
-- Middle and ring fingers folded down
-- Palm facing the camera
-- Thumb may be extended or tucked
-
-Respond ONLY with valid JSON, no markdown:
-{"gesture_detected": true/false, "confidence": 0.0-1.0, "description": "brief description"}"""
+CEFA_BLUE = RGBColor(0x01, 0x27, 0x7A)
+CEFA_RED = RGBColor(0xF0, 0x19, 0x28)
 
 
-def download_video(url: str, dest: str) -> bool:
-    """Download video from URL. Handles Google Drive large file confirmation."""
-    import re
-    session = requests.Session()
-
-    r = session.get(url, stream=True, timeout=120)
-    r.raise_for_status()
-
-    # Google Drive returns an HTML confirmation page for large files
-    content_type = r.headers.get("Content-Type", "")
-    if "text/html" in content_type:
-        chunk = next(r.iter_content(chunk_size=32768), b"")
-        text = chunk.decode("utf-8", errors="ignore")
-
-        # Try confirm token pattern
-        match = re.search(r'confirm=([^&"]+)', text)
-        if match:
-            confirm_token = match.group(1)
-            file_id = re.search(r'[?&]id=([^&]+)', url)
-            if file_id:
-                url = f"https://drive.google.com/uc?export=download&confirm={confirm_token}&id={file_id.group(1)}"
-            else:
-                url = url + f"&confirm={confirm_token}"
-        else:
-            # Newer Drive flow
-            file_id_match = re.search(r'[?&]id=([^&]+)', url)
-            if file_id_match:
-                fid = file_id_match.group(1)
-                url = f"https://drive.usercontent.google.com/download?id={fid}&export=download&confirm=t"
-
-        r = session.get(url, stream=True, timeout=300)
-        r.raise_for_status()
-
-    with open(dest, "wb") as f:
-        for chunk in r.iter_content(chunk_size=65536):
-            if chunk:
-                f.write(chunk)
-
-    size = os.path.getsize(dest)
-    if size < 100_000:
-        raise ValueError(f"Downloaded file too small ({size} bytes) - likely not a valid video or Drive link is not public")
-
-    return True
+def set_cell_background(cell, hex_color: str):
+    """Set table cell background color."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color)
+    tcPr.append(shd)
 
 
-def compress_video(video_path: str) -> str:
+def add_horizontal_rule(doc, color_hex="01277A"):
+    """Add a colored horizontal line via paragraph border."""
+    p = doc.add_paragraph()
+    pPr = p._p.get_or_add_pPr()
+    pBdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "6")
+    bottom.set(qn("w:space"), "1")
+    bottom.set(qn("w:color"), color_hex)
+    pBdr.append(bottom)
+    pPr.append(pBdr)
+    p.paragraph_format.space_after = Pt(6)
+    return p
+
+
+def build_docx(title: str, steps: list[dict], metadata: dict) -> bytes:
     """
-    Recompress video to 720p max, CRF 28, before processing.
-    Returns path to compressed file (replaces original).
+    Build the Word document from processed steps.
+    Each step: { step_number, start_time, end_time, text, frames_base64 }
     """
-    compressed = video_path.replace(".mp4", "_compressed.mp4")
-    # Use Popen instead of run to avoid gunicorn worker timeout killing the process
-    rc = _run_ffmpeg([
-        FFMPEG, "-y", "-i", video_path,
-        "-vf", "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease,pad=ceil(iw/2)*2:ceil(ih/2)*2",
-        "-c:v", "libx264", "-crf", "28", "-preset", "veryfast",
-        "-c:a", "aac", "-b:a", "64k",
-        "-movflags", "+faststart",
-        compressed
-    ])
-    if rc != 0:
-        raise subprocess.CalledProcessError(rc, FFMPEG)
-    os.remove(video_path)
-    os.rename(compressed, video_path)
-    return video_path
-
-
-def extract_audio(video_path: str, audio_path: str):
-    """Extract audio as mp3 using ffmpeg."""
-    rc = _run_ffmpeg([
-        FFMPEG, "-y", "-i", video_path,
-        "-vn", "-ar", "16000", "-ac", "1", "-b:a", "64k",
-        audio_path
-    ])
-    if rc != 0:
-        raise subprocess.CalledProcessError(rc, FFMPEG)
-
-
-def extract_frames(video_path: str, frames_dir: str, fps: float = 1.0):
-    """Extract frames at given fps, capped at 300 frames to avoid OOM."""
-    Path(frames_dir).mkdir(exist_ok=True)
-    rc = _run_ffmpeg([
-        FFMPEG, "-y", "-i", video_path,
-        "-vf", f"fps={fps},scale=480:-2",
-        "-q:v", "5",
-        "-frames:v", "300",
-        f"{frames_dir}/frame_%06d.jpg"
-    ])
-    if rc != 0:
-        raise subprocess.CalledProcessError(rc, FFMPEG)
-
-
-def get_video_duration(video_path: str) -> float:
-    """Get video duration in seconds."""
-    # ffprobe may not be bundled; fall back to ffmpeg stream info
-    try:
-        result = subprocess.run([
-            FFMPEG, "-i", video_path
-        ], capture_output=True, text=True)
-        # ffmpeg prints duration to stderr even on "error"
-        for line in result.stderr.splitlines():
-            if "Duration:" in line:
-                parts = line.strip().split("Duration:")[1].split(",")[0].strip()
-                h, m, s = parts.split(":")
-                return float(h) * 3600 + float(m) * 60 + float(s)
-    except Exception:
-        pass
-    return 0.0
-
-
-def transcribe_audio(audio_path: str) -> dict:
-    """Transcribe audio with Whisper, getting word and segment-level timestamps."""
-    with open(audio_path, "rb") as f:
-        response = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            response_format="verbose_json",
-            timestamp_granularities=["word", "segment"]
-        )
-    result = response.model_dump()
-    # Free disk space immediately
-    try:
-        os.remove(audio_path)
-    except Exception:
-        pass
-    return result
-
-
-def find_keyword_timestamps(transcription: dict, keyword: str) -> list:
-    """Find timestamps where the keyword appears in the transcription."""
-    keyword_lower = keyword.lower().strip()
-    timestamps = []
-    segments = transcription.get("segments", [])
-    for seg in segments:
-        text = seg.get("text", "").lower()
-        if keyword_lower in text:
-            timestamps.append(seg.get("start", 0.0))
-    return timestamps
-
-
-def analyze_frame_for_gesture(frame_path: str) -> dict:
-    """Use GPT-4o Vision to detect the rock gesture in a frame."""
-    with open(frame_path, "rb") as f:
-        img_b64 = base64.b64encode(f.read()).decode()
-
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        max_tokens=200,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {
-                    "url": f"data:image/jpeg;base64,{img_b64}",
-                    "detail": "low"
-                }},
-                {"type": "text", "text": GESTURE_PROMPT}
-            ]
-        }]
+    doc = Document()
+    
+    # --- Page setup (A4) ---
+    section = doc.sections[0]
+    section.page_width = Cm(21)
+    section.page_height = Cm(29.7)
+    section.left_margin = Cm(2.5)
+    section.right_margin = Cm(2.5)
+    section.top_margin = Cm(2.5)
+    section.bottom_margin = Cm(2.5)
+    
+    # --- Styles ---
+    styles = doc.styles
+    
+    # Normal style
+    normal = styles["Normal"]
+    normal.font.name = "Arial"
+    normal.font.size = Pt(11)
+    
+    # Heading 1 override
+    h1 = styles["Heading 1"]
+    h1.font.name = "Arial"
+    h1.font.size = Pt(18)
+    h1.font.bold = True
+    h1.font.color.rgb = CEFA_BLUE
+    
+    # Heading 2 override
+    h2 = styles["Heading 2"]
+    h2.font.name = "Arial"
+    h2.font.size = Pt(13)
+    h2.font.bold = True
+    h2.font.color.rgb = CEFA_BLUE
+    
+    # --- Cover block ---
+    # Title
+    title_para = doc.add_paragraph()
+    title_para.paragraph_format.space_before = Pt(24)
+    title_para.paragraph_format.space_after = Pt(6)
+    title_run = title_para.add_run(title)
+    title_run.font.name = "Arial"
+    title_run.font.size = Pt(22)
+    title_run.font.bold = True
+    title_run.font.color.rgb = CEFA_BLUE
+    title_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    
+    add_horizontal_rule(doc, "01277A")
+    
+    # Metadata line
+    date_str = datetime.datetime.now().strftime("%d/%m/%Y")
+    meta_para = doc.add_paragraph()
+    meta_para.paragraph_format.space_after = Pt(18)
+    meta_run = meta_para.add_run(
+        f"Generado automáticamente  ·  {date_str}  ·  {metadata.get('total_steps', len(steps))} pasos  ·  Duración: {_fmt_duration(metadata.get('duration', 0))}"
     )
+    meta_run.font.name = "Arial"
+    meta_run.font.size = Pt(9)
+    meta_run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+    
+    # Full transcript (collapsed/summary)
+    transcript = metadata.get("full_transcript", "")
+    if transcript:
+        doc.add_heading("Transcripción completa", level=2)
+        t_para = doc.add_paragraph(transcript)
+        t_para.paragraph_format.space_after = Pt(18)
+        for run in t_para.runs:
+            run.font.size = Pt(10)
+            run.font.color.rgb = RGBColor(0x44, 0x44, 0x44)
+        add_horizontal_rule(doc, "CCCCCC")
+    
+    # --- Steps ---
+    doc.add_heading("Pasos del procedimiento", level=1)
+    
+    for step in steps:
+        num = step.get("step_number", "?")
+        text = step.get("text", "").strip()
+        frames = step.get("frames_base64", [])
+        start = step.get("start_time", 0)
+        end = step.get("end_time", 0)
+        
+        # Step heading
+        step_heading = doc.add_heading(f"Paso {num}", level=2)
+        step_heading.paragraph_format.space_before = Pt(14)
+        
+        # Time badge
+        time_para = doc.add_paragraph()
+        time_run = time_para.add_run(f"⏱  {_fmt_duration(start)} – {_fmt_duration(end)}")
+        time_run.font.size = Pt(9)
+        time_run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+        time_para.paragraph_format.space_after = Pt(4)
+        
+        # Step text
+        if text:
+            text_para = doc.add_paragraph(text)
+            text_para.paragraph_format.space_after = Pt(8)
+            for run in text_para.runs:
+                run.font.name = "Arial"
+                run.font.size = Pt(11)
+        
+        # Frames: lay them out in a row (max 3 per row)
+        if frames:
+            _add_frames_row(doc, frames)
+        
+        # Subtle separator
+        add_horizontal_rule(doc, "DDDDDD")
+    
+    # --- Footer ---
+    footer = section.footer
+    footer_para = footer.paragraphs[0]
+    footer_para.clear()
+    footer_run = footer_para.add_run("CEFA Celulosa Fabril · Transformación Digital · Generado automáticamente")
+    footer_run.font.name = "Arial"
+    footer_run.font.size = Pt(8)
+    footer_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+    footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    
+    # Serialize to bytes
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf.read()
 
-    try:
-        text = response.choices[0].message.content.strip()
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-        return json.loads(text.strip())
-    except Exception:
-        return {"gesture_detected": False, "confidence": 0.0, "description": "parse error"}
+
+def _add_frames_row(doc: Document, frames_b64: list, max_width_cm: float = 5.0):
+    """Add images side by side in a table row."""
+    # Filter valid frames first
+    valid_frames = []
+    for f in frames_b64[:3]:
+        try:
+            img_bytes = base64.b64decode(f)
+            if len(img_bytes) > 100:  # sanity check
+                valid_frames.append(img_bytes)
+        except Exception:
+            pass
+
+    n = len(valid_frames)
+    if n == 0:
+        return
+
+    table = doc.add_table(rows=1, cols=n)
+    table.style = "Table Grid"
+
+    row = table.rows[0]
+    for i, img_bytes in enumerate(valid_frames):
+        cell = row.cells[i]
+        para = cell.paragraphs[0]
+        para.clear()
+        try:
+            img_stream = io.BytesIO(img_bytes)
+            run = para.add_run()
+            run.add_picture(img_stream, width=Cm(max_width_cm))
+        except Exception as e:
+            para.add_run(f"[imagen {i+1}]")
+
+    doc.add_paragraph()
 
 
-def find_gesture_timestamps(frames_dir: str, fps: float, audio_timestamps: list, window: float = 3.0) -> list:
+def _fmt_duration(seconds: float) -> str:
+    """Format seconds as mm:ss."""
+    s = int(seconds)
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+@docx_bp.route("/generate-docx", methods=["POST"])
+def generate_docx():
     """
-    Only analyze frames near audio keyword timestamps (±window seconds).
-    Returns confirmed timestamps where gesture was detected, or falls back to audio-only.
+    Expects JSON:
+    {
+        "title": "Procedimiento: Preparación máquina X",
+        "steps": [...],           // from /process-video
+        "duration": 180.0,
+        "full_transcript": "...",
+        "total_steps": 5
+    }
+    Returns: .docx file as binary (application/vnd.openxmlformats...)
     """
-    frames = sorted(Path(frames_dir).glob("frame_*.jpg"))
-    confirmed_timestamps = []
-
-    for audio_ts in audio_timestamps:
-        best_match = None
-        best_confidence = 0.0
-
-        for frame in frames:
-            frame_num = int(frame.stem.split("_")[1])
-            frame_time = (frame_num - 1) / fps
-
-            if abs(frame_time - audio_ts) <= window:
-                result = analyze_frame_for_gesture(str(frame))
-                if result.get("gesture_detected") and result.get("confidence", 0) > best_confidence:
-                    best_confidence = result["confidence"]
-                    best_match = frame_time
-
-        # Use gesture timestamp if found, otherwise fall back to audio timestamp
-        confirmed_timestamps.append(best_match if best_match is not None else audio_ts)
-
-    return sorted(set(confirmed_timestamps))
-
-
-def get_step_frames(frames_dir: str, fps: float, start_time: float, end_time: float, max_frames: int = 3) -> list:
-    """Get representative frames for a step (evenly distributed). Returns list of base64 JPEGs."""
-    frames = sorted(Path(frames_dir).glob("frame_*.jpg"))
-    step_frames = []
-
-    for frame in frames:
-        frame_num = int(frame.stem.split("_")[1])
-        frame_time = (frame_num - 1) / fps
-        if start_time <= frame_time < end_time:
-            step_frames.append((frame_time, str(frame)))
-
-    if not step_frames:
-        return []
-
-    if len(step_frames) <= max_frames:
-        selected = step_frames
-    else:
-        step = len(step_frames) // max_frames
-        selected = step_frames[::step][:max_frames]
-
-    result = []
-    for _, path in selected:
-        with open(path, "rb") as f:
-            result.append(base64.b64encode(f.read()).decode())
-    return result
-
-
-def _clean_keyword(text: str) -> str:
-    """Remove keyword phrase from text (start or anywhere)."""
-    kw = KEYWORD.lower()
-    t = text.strip()
-    tl = t.lower()
-    if kw in tl:
-        idx = tl.find(kw)
-        # Remove everything from keyword onwards (it marks end of step)
-        t = t[:idx].strip().rstrip(",. ")
-    return t
-
-
-def build_steps(transcription: dict, split_timestamps: list, frames_dir: str, fps: float, duration: float) -> list:
-    """Segment transcription and frames into steps based on split timestamps."""
-    boundaries = [0.0] + sorted(split_timestamps) + [duration]
-    keyword_lower = KEYWORD.lower()
-    steps = []
-
-    # Try word-level timestamps first (more precise)
-    words = transcription.get("words", [])
-
-    if words:
-        # Use word-level: assign each word to a step based on its timestamp
-        for i in range(len(boundaries) - 1):
-            start = boundaries[i]
-            end = boundaries[i + 1]
-
-            step_words = [
-                w["word"] for w in words
-                if w.get("start", 0) >= start and w.get("start", 0) < end
-            ]
-            step_text = " ".join(step_words).strip()
-            step_text = _clean_keyword(step_text)
-
-            frames_b64 = get_step_frames(frames_dir, fps, start, end)
-
-            if step_text or frames_b64:
-                steps.append({
-                    "step_number": i + 1,
-                    "start_time": round(start, 1),
-                    "end_time": round(end, 1),
-                    "text": step_text,
-                    "frames_base64": frames_b64
-                })
-    else:
-        # Fallback: use segments. If a segment spans a boundary, split it proportionally.
-        segments = transcription.get("segments", [])
-        full_text = transcription.get("text", "")
-
-        for i in range(len(boundaries) - 1):
-            start = boundaries[i]
-            end = boundaries[i + 1]
-
-            step_parts = []
-            for seg in segments:
-                seg_start = seg.get("start", 0)
-                seg_end = seg.get("end", seg_start + 1)
-                seg_text = seg.get("text", "").strip()
-
-                if seg_end <= start or seg_start >= end:
-                    continue  # outside window
-
-                if keyword_lower in seg_text.lower():
-                    # This segment contains the keyword - take only the part before it
-                    kw_idx = seg_text.lower().find(keyword_lower)
-                    if seg_start >= start:
-                        # Segment starts in this step - take text before keyword
-                        part = seg_text[:kw_idx].strip()
-                        if part:
-                            step_parts.append(part)
-                    # Don't include the keyword or anything after it
-                else:
-                    # Full segment in window
-                    if seg_start >= start:
-                        step_parts.append(seg_text)
-                    else:
-                        # Segment started before this window - skip (already counted)
-                        pass
-
-            step_text = " ".join(step_parts).strip()
-            step_text = _clean_keyword(step_text)
-
-            frames_b64 = get_step_frames(frames_dir, fps, start, end)
-
-            if step_text or frames_b64:
-                steps.append({
-                    "step_number": i + 1,
-                    "start_time": round(start, 1),
-                    "end_time": round(end, 1),
-                    "text": step_text,
-                    "frames_base64": frames_b64
-                })
-
-    return steps
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "ffmpeg": FFMPEG})
-
-
-@app.route("/process-video", methods=["POST"])
-def process_video():
     data = request.get_json()
-    if not data or "video_url" not in data:
-        return jsonify({"error": "video_url required"}), 400
-
-    video_url = data["video_url"]
-    keyword = data.get("keyword", KEYWORD)
-    fps = float(data.get("fps", 1.0))
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        video_path = os.path.join(tmpdir, "input.mp4")
-        audio_path = os.path.join(tmpdir, "audio.mp3")
-        frames_dir = os.path.join(tmpdir, "frames")
-
-        try:
-            download_video(video_url, video_path)
-        except Exception as e:
-            return jsonify({"error": f"Download failed: {str(e)}"}), 400
-
-        duration = get_video_duration(video_path)
-
-        try:
-            # Recompress to 720p to reduce RAM usage during frame extraction
-            compress_video(video_path)
-            extract_audio(video_path, audio_path)
-            extract_frames(video_path, frames_dir, fps)
-            # Delete compressed video immediately to free memory
-            os.remove(video_path)
-        except subprocess.CalledProcessError as e:
-            stderr_text = e.stderr.decode() if e.stderr else "no stderr"
-            return jsonify({"error": f"ffmpeg error: {stderr_text}"}), 500
-
-        try:
-            transcription = transcribe_audio(audio_path)
-        except Exception as e:
-            return jsonify({"error": f"Transcription failed: {str(e)}"}), 500
-
-        audio_timestamps = find_keyword_timestamps(transcription, keyword)
-        confirmed_timestamps = find_gesture_timestamps(frames_dir, fps, audio_timestamps)
-        steps = build_steps(transcription, confirmed_timestamps, frames_dir, fps, duration)
-
-        return jsonify({
-            "steps": steps,
-            "total_steps": len(steps),
-            "duration": round(duration, 1),
-            "split_timestamps": confirmed_timestamps,
-            "full_transcript": transcription.get("text", "")
-        })
+    if not data:
+        return jsonify({"error": "JSON body required"}), 400
+    
+    title = data.get("title", "Informe de procedimiento")
+    steps = data.get("steps", [])
+    metadata = {
+        "duration": data.get("duration", 0),
+        "full_transcript": data.get("full_transcript", ""),
+        "total_steps": data.get("total_steps", len(steps))
+    }
+    
+    try:
+        docx_bytes = build_docx(title, steps, metadata)
+    except Exception as e:
+        return jsonify({"error": f"docx generation failed: {str(e)}"}), 500
+    
+    # Return as base64 so n8n can handle it easily
+    docx_b64 = base64.b64encode(docx_bytes).decode()
+    filename = title.replace(" ", "_").replace(":", "")[:60] + ".docx"
+    
+    return jsonify({
+        "docx_base64": docx_b64,
+        "filename": filename,
+        "size_bytes": len(docx_bytes)
+    })
