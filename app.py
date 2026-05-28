@@ -157,13 +157,13 @@ def get_video_duration(video_path: str) -> float:
 
 
 def transcribe_audio(audio_path: str) -> dict:
-    """Transcribe audio with Whisper, getting segment-level timestamps."""
+    """Transcribe audio with Whisper, getting word and segment-level timestamps."""
     with open(audio_path, "rb") as f:
         response = client.audio.transcriptions.create(
             model="whisper-1",
             file=f,
             response_format="verbose_json",
-            timestamp_granularities=["segment"]
+            timestamp_granularities=["word", "segment"]
         )
     result = response.model_dump()
     # Free disk space immediately
@@ -272,49 +272,98 @@ def get_step_frames(frames_dir: str, fps: float, start_time: float, end_time: fl
     return result
 
 
+def _clean_keyword(text: str) -> str:
+    """Remove keyword phrase from text (start or anywhere)."""
+    kw = KEYWORD.lower()
+    t = text.strip()
+    tl = t.lower()
+    if kw in tl:
+        idx = tl.find(kw)
+        # Remove everything from keyword onwards (it marks end of step)
+        t = t[:idx].strip().rstrip(",. ")
+    return t
+
+
 def build_steps(transcription: dict, split_timestamps: list, frames_dir: str, fps: float, duration: float) -> list:
     """Segment transcription and frames into steps based on split timestamps."""
     boundaries = [0.0] + sorted(split_timestamps) + [duration]
-    segments = transcription.get("segments", [])
     keyword_lower = KEYWORD.lower()
     steps = []
 
-    for i in range(len(boundaries) - 1):
-        start = boundaries[i]
-        end = boundaries[i + 1]
+    # Try word-level timestamps first (more precise)
+    words = transcription.get("words", [])
 
-        # Collect segments for this time window
-        window_segs = [
-            seg for seg in segments
-            if seg.get("start", 0) >= start and seg.get("start", 0) < end
-        ]
+    if words:
+        # Use word-level: assign each word to a step based on its timestamp
+        for i in range(len(boundaries) - 1):
+            start = boundaries[i]
+            end = boundaries[i + 1]
 
-        # Remove the keyword segment itself (it's the transition marker, not content)
-        # The keyword segment is the one whose text contains the keyword phrase
-        content_segs = [
-            seg for seg in window_segs
-            if keyword_lower not in seg.get("text", "").lower()
-        ]
+            step_words = [
+                w["word"] for w in words
+                if w.get("start", 0) >= start and w.get("start", 0) < end
+            ]
+            step_text = " ".join(step_words).strip()
+            step_text = _clean_keyword(step_text)
 
-        step_text = " ".join(seg["text"].strip() for seg in content_segs).strip()
+            frames_b64 = get_step_frames(frames_dir, fps, start, end)
 
-        # Also strip keyword if it leaked to start/end of text
-        if step_text.lower().startswith(keyword_lower):
-            step_text = step_text[len(keyword_lower):].strip().lstrip(",. ")
-        if keyword_lower in step_text.lower():
-            idx = step_text.lower().find(keyword_lower)
-            step_text = step_text[:idx].strip()
+            if step_text or frames_b64:
+                steps.append({
+                    "step_number": i + 1,
+                    "start_time": round(start, 1),
+                    "end_time": round(end, 1),
+                    "text": step_text,
+                    "frames_base64": frames_b64
+                })
+    else:
+        # Fallback: use segments. If a segment spans a boundary, split it proportionally.
+        segments = transcription.get("segments", [])
+        full_text = transcription.get("text", "")
 
-        frames_b64 = get_step_frames(frames_dir, fps, start, end)
+        for i in range(len(boundaries) - 1):
+            start = boundaries[i]
+            end = boundaries[i + 1]
 
-        if step_text or frames_b64:
-            steps.append({
-                "step_number": i + 1,
-                "start_time": round(start, 1),
-                "end_time": round(end, 1),
-                "text": step_text,
-                "frames_base64": frames_b64
-            })
+            step_parts = []
+            for seg in segments:
+                seg_start = seg.get("start", 0)
+                seg_end = seg.get("end", seg_start + 1)
+                seg_text = seg.get("text", "").strip()
+
+                if seg_end <= start or seg_start >= end:
+                    continue  # outside window
+
+                if keyword_lower in seg_text.lower():
+                    # This segment contains the keyword - take only the part before it
+                    kw_idx = seg_text.lower().find(keyword_lower)
+                    if seg_start >= start:
+                        # Segment starts in this step - take text before keyword
+                        part = seg_text[:kw_idx].strip()
+                        if part:
+                            step_parts.append(part)
+                    # Don't include the keyword or anything after it
+                else:
+                    # Full segment in window
+                    if seg_start >= start:
+                        step_parts.append(seg_text)
+                    else:
+                        # Segment started before this window - skip (already counted)
+                        pass
+
+            step_text = " ".join(step_parts).strip()
+            step_text = _clean_keyword(step_text)
+
+            frames_b64 = get_step_frames(frames_dir, fps, start, end)
+
+            if step_text or frames_b64:
+                steps.append({
+                    "step_number": i + 1,
+                    "start_time": round(start, 1),
+                    "end_time": round(end, 1),
+                    "text": step_text,
+                    "frames_base64": frames_b64
+                })
 
     return steps
 
